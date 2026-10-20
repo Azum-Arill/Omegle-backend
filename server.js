@@ -70,11 +70,37 @@ function enqueue(socket) {
   waiting = socket.id;
 }
 
+function broadcastOnlineCount() {
+  io.emit('online-count', io.engine.clientsCount);
+}
+
 io.on('connection', (socket) => {
   console.log(`connected: ${socket.id}`);
 
-  // New arrival joins the queue (and is paired immediately if someone waits).
-  enqueue(socket);
+  // Every connection counts as online, but only joins the queue on 'join'.
+  broadcastOnlineCount();
+
+  // Client pressed Start: enter the queue (ignored if already queued or paired).
+  socket.on('join', () => {
+    if (partners.has(socket.id)) return;
+    enqueue(socket);
+  });
+
+  // Client pressed Stop: leave the pairing and the queue, keep the connection.
+  socket.on('leave', () => {
+    leavePartner(socket, 'leave');
+    if (waiting === socket.id) waiting = null;
+  });
+
+  // Log the report, drop the pairing, and requeue the reporter.
+  socket.on('report', (payload) => {
+    const partnerId = partners.get(socket.id);
+    if (!partnerId) return;
+    const reason = typeof payload?.reason === 'string' ? payload.reason.slice(0, 50) : 'Other';
+    console.log(`report: ${socket.id} reported ${partnerId} (${reason})`);
+    leavePartner(socket, 'reported');
+    enqueue(socket);
+  });
 
   // Relay WebRTC signalling verbatim to the current partner.
   const forward = (event) => (payload) => {
@@ -100,6 +126,7 @@ io.on('connection', (socket) => {
 
     // Clear the queue slot if this socket was the one waiting.
     if (waiting === socket.id) waiting = null;
+    broadcastOnlineCount();
   });
 });
 
