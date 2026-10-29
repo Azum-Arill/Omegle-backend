@@ -34,8 +34,8 @@ const BLOCKED_IPS = new Set(
 );
 
 const RATE_WINDOW_MS = 60 * 1000;
-const RATE_MAX_CONNECTIONS = 10;
-const RATE_BAN_MS = 5 * 60 * 1000;
+const RATE_MAX_CONNECTIONS = 30;
+const RATE_BAN_MS = 60 * 1000;
 
 // ip -> { times: connection timestamps within the window, bannedUntil }
 const connectionLog = new Map();
@@ -70,9 +70,11 @@ setInterval(() => {
 io.use((socket, next) => {
   const ip = getIp(socket);
   if (BLOCKED_IPS.has(ip)) {
+    console.log(`refused: reason=blocklist ip=${ip}`);
     return next(new Error('blocked'));
   }
   if (isRateLimited(ip, Date.now())) {
+    console.log(`refused: reason=rate limit ip=${ip}`);
     return next(new Error('rate limited'));
   }
   next();
@@ -84,6 +86,13 @@ let waiting = null;
 // Map of socket.id -> partner socket.id for everyone currently paired.
 const partners = new Map();
 
+// Pair key -> number of ice-candidates relayed so far (cleared when the pair ends).
+const iceCounts = new Map();
+
+function pairKey(x, y) {
+  return x < y ? `${x}|${y}` : `${y}|${x}`;
+}
+
 function pair(a, b) {
   const room = `${a.id}#${b.id}`;
   a.join(room);
@@ -93,6 +102,7 @@ function pair(a, b) {
   partners.set(b.id, a.id);
 
   // One side is the designated initiator (creates the WebRTC offer).
+  console.log(`paired: ${a.id} (initiator) <-> ${b.id}`);
   a.emit('matched', { room, initiator: true });
   b.emit('matched', { room, initiator: false });
 }
@@ -104,6 +114,8 @@ function leavePartner(socket, reason) {
   // Tear down the pairing on both sides.
   partners.delete(socket.id);
   partners.delete(partnerId);
+  iceCounts.delete(pairKey(socket.id, partnerId));
+  console.log(`partner-left: ${partnerId} told by ${socket.id} reason=${reason}`);
 
   const partner = io.sockets.sockets.get(partnerId);
   if (partner) {
@@ -168,7 +180,16 @@ io.on('connection', (socket) => {
     const partnerId = partners.get(socket.id);
     if (!partnerId) return;
     const partner = io.sockets.sockets.get(partnerId);
-    if (partner) partner.emit(event, payload);
+    if (!partner) return;
+    if (event === 'ice-candidate') {
+      const key = pairKey(socket.id, partnerId);
+      const count = (iceCounts.get(key) || 0) + 1;
+      iceCounts.set(key, count);
+      console.log(`relay: ice-candidate from=${socket.id} to=${partnerId} count=${count}`);
+    } else {
+      console.log(`relay: ${event} from=${socket.id} to=${partnerId}`);
+    }
+    partner.emit(event, payload);
   };
 
   socket.on('offer', forward('offer'));
