@@ -14,11 +14,6 @@ const io = new Server(server, {
   },
 });
 
-// Simple health check.
-app.get('/', (req, res) => {
-  res.json({ status: 'running', online: io.engine.clientsCount });
-});
-
 // Client IP: first x-forwarded-for value, falling back to the socket address.
 function getIp(socket) {
   const forwarded = socket.handshake.headers['x-forwarded-for'];
@@ -36,6 +31,11 @@ const BLOCKED_IPS = new Set(
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_MAX_CONNECTIONS = 30;
 const RATE_BAN_MS = 60 * 1000;
+
+// After two people part ways they will not be matched with each other again for this long.
+// Reported pairs are kept apart for much longer. Both can be overridden with env vars.
+const REMATCH_COOLDOWN_MS = Number(process.env.REMATCH_COOLDOWN_MS) || 30 * 1000;
+const REPORT_COOLDOWN_MS = Number(process.env.REPORT_COOLDOWN_MS) || 10 * 60 * 1000;
 
 // ip -> { times: connection timestamps within the window, bannedUntil }
 const connectionLog = new Map();
@@ -80,8 +80,8 @@ io.use((socket, next) => {
   next();
 });
 
-// Socket id of a user currently waiting for a partner, or null if nobody waits.
-let waiting = null;
+// Socket ids waiting for a partner, oldest first.
+let queue = [];
 
 // Map of socket.id -> partner socket.id for everyone currently paired.
 const partners = new Map();
@@ -89,8 +89,25 @@ const partners = new Map();
 // Pair key -> number of ice-candidates relayed so far (cleared when the pair ends).
 const iceCounts = new Map();
 
+// socket.id -> { id, until }: the last partner this socket must not be re-matched with yet.
+const noRematch = new Map();
+
 function pairKey(x, y) {
   return x < y ? `${x}|${y}` : `${y}|${x}`;
+}
+
+function blockRematch(aId, bId, ms) {
+  const until = Date.now() + ms;
+  noRematch.set(aId, { id: bId, until });
+  noRematch.set(bId, { id: aId, until });
+}
+
+function canPair(aId, bId, now) {
+  const x = noRematch.get(aId);
+  if (x && x.id === bId && x.until > now) return false;
+  const y = noRematch.get(bId);
+  if (y && y.id === aId && y.until > now) return false;
+  return true;
 }
 
 function pair(a, b) {
@@ -101,49 +118,83 @@ function pair(a, b) {
   partners.set(a.id, b.id);
   partners.set(b.id, a.id);
 
-  // One side is the designated initiator (creates the WebRTC offer).
+  // The person who has waited longest is the initiator (creates the WebRTC offer).
   console.log(`paired: ${a.id} (initiator) <-> ${b.id}`);
   a.emit('matched', { room, initiator: true });
   b.emit('matched', { room, initiator: false });
 }
 
+// Pair up everyone in the queue who can be paired. Safe to call at any time.
+function tryMatch() {
+  const now = Date.now();
+
+  // Forget sockets that have gone away or are already paired.
+  queue = queue.filter((id) => {
+    const s = io.sockets.sockets.get(id);
+    return s && s.connected && !partners.has(id);
+  });
+
+  for (let i = 0; i < queue.length; i++) {
+    for (let j = i + 1; j < queue.length; j++) {
+      if (!canPair(queue[i], queue[j], now)) continue;
+      const a = io.sockets.sockets.get(queue[i]);
+      const b = io.sockets.sockets.get(queue[j]);
+      queue.splice(j, 1);
+      queue.splice(i, 1);
+      pair(a, b);
+      i--; // the next waiting socket has moved into slot i
+      break;
+    }
+  }
+}
+
+function enqueue(socket) {
+  // Ignore sockets that are already queued or already paired.
+  if (partners.has(socket.id) || queue.includes(socket.id)) return;
+  queue.push(socket.id);
+  console.log(`queued: ${socket.id} (waiting=${queue.length})`);
+  tryMatch();
+}
+
+function dequeue(id) {
+  queue = queue.filter((x) => x !== id);
+}
+
+// Break the pairing of `socket`. The remaining partner is told and goes back in the queue.
 function leavePartner(socket, reason) {
   const partnerId = partners.get(socket.id);
   if (!partnerId) return;
 
-  // Tear down the pairing on both sides.
   partners.delete(socket.id);
   partners.delete(partnerId);
   iceCounts.delete(pairKey(socket.id, partnerId));
+  blockRematch(socket.id, partnerId, reason === 'reported' ? REPORT_COOLDOWN_MS : REMATCH_COOLDOWN_MS);
   console.log(`partner-left: ${partnerId} told by ${socket.id} reason=${reason}`);
 
   const partner = io.sockets.sockets.get(partnerId);
   if (partner) {
     partner.emit('partner-left', { reason });
+    // They still want someone to talk to, so they keep waiting.
+    enqueue(partner);
   }
 }
 
-function enqueue(socket) {
-  // Don't let a socket queue twice.
-  if (waiting === socket.id) return;
-
-  if (waiting && waiting !== socket.id) {
-    const other = io.sockets.sockets.get(waiting);
-    waiting = null;
-
-    // The waiting socket may have vanished; if so, this socket waits instead.
-    if (other && other.connected) {
-      pair(other, socket);
-      return;
-    }
-  }
-
-  waiting = socket.id;
-}
+// Simple health check, with a few live numbers.
+app.get('/', (req, res) => {
+  res.json({
+    status: 'running',
+    online: io.engine.clientsCount,
+    waiting: queue.length,
+    inCalls: partners.size,
+  });
+});
 
 function broadcastOnlineCount() {
   io.emit('online-count', io.engine.clientsCount);
 }
+
+// Re-check the queue now and then so cooldowns that expire lead to matches.
+setInterval(tryMatch, 2000).unref();
 
 io.on('connection', (socket) => {
   console.log(`connected: ${socket.id}`);
@@ -153,14 +204,13 @@ io.on('connection', (socket) => {
 
   // Client pressed Start: enter the queue (ignored if already queued or paired).
   socket.on('join', () => {
-    if (partners.has(socket.id)) return;
     enqueue(socket);
   });
 
   // Client pressed Stop: leave the pairing and the queue, keep the connection.
   socket.on('leave', () => {
     leavePartner(socket, 'leave');
-    if (waiting === socket.id) waiting = null;
+    dequeue(socket.id);
   });
 
   // Log the report, drop the pairing, and requeue the reporter.
@@ -205,9 +255,8 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`disconnected: ${socket.id}`);
     leavePartner(socket, 'disconnect');
-
-    // Clear the queue slot if this socket was the one waiting.
-    if (waiting === socket.id) waiting = null;
+    dequeue(socket.id);
+    noRematch.delete(socket.id);
     broadcastOnlineCount();
   });
 });
